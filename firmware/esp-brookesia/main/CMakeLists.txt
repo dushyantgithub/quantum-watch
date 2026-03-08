@@ -1,6 +1,7 @@
 idf_component_register(
-    SRCS "main.cpp"
-    INCLUDE_DIRS ".")
+    SRCS "main.cpp" "buttons.c" "away_screen.cpp" "bg_image.c"
+    INCLUDE_DIRS "."
+    REQUIRES brookesia_app_squareline_demo brookesia_app_settings)
 
 target_compile_options(${COMPONENT_LIB} PUBLIC -Wno-missing-field-initializers)
 

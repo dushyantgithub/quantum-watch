@@ -23,8 +23,12 @@ idf.py -p /dev/cu.usbmodem1101 flash
 idf.py -p /dev/cu.usbmodem1101 monitor
 ```
 
-**Power**: Hold PWR 6s to power off; press PWR to power on.  
-**Download mode**: Hold BOOT while powering on.
+**Buttons** (custom firmware):
+- **BOOT** short press: toggle screen on/off
+- **BOOT** long press (2s): shutdown (deep sleep). Press BOOT again to wake
+- **PWR**: navigate to home screen
+
+**Download mode**: Hold BOOT while powering on (before custom firmware runs).
 
 ## Restore Factory Firmware
 

@@ -1,0 +1,215 @@
+================================================================================
+NEXT FEATURE: Voice Assistant via BLE (Watch ↔ iPhone)
+================================================================================
+
+User speaks into the watch mic → audio streams over BLE to iPhone → iPhone
+runs speech-to-text and AI processing → response text sent back over BLE →
+watch displays the response on screen.
+
+================================================================================
+SECTION 1: WATCH APP (ESP32-S3 / ESP-IDF / LVGL)
+================================================================================
+
+HARDWARE CONTEXT:
+- Board: Waveshare ESP32-S3-Touch-AMOLED-2.06
+- Display: 410x502 AMOLED
+- Audio codecs: ES8311 (DAC/speaker), ES7210 (ADC/mic) — built-in mic
+- BLE: Bluedroid stack already enabled (GATT server + client, BLE 5)
+- BSP component: waveshare/esp32_s3_touch_amoled_2_06 (provides bsp_audio_init,
+  bsp_audio_codec_speaker_init, I2S pin mappings)
+
+EXISTING CODEBASE CONTEXT:
+- Framework: esp-brookesia (phone-like UI framework on LVGL 9.2)
+- Build system: ESP-IDF 5.4, CMake
+- Firmware root: firmware/esp-brookesia/
+- Main entry: firmware/esp-brookesia/main/main.cpp
+- Existing apps register via phone->initAppFromRegistry() / phone->installAppFromRegistry()
+- Settings app example: components/brookesia_app_settings/esp_brookesia_app_settings.cpp
+  (shows how to create an app with LVGL UI, register it, use NVS, use BSP audio APIs)
+- Audio framework reference: components/brookesia_core/ai_framework/agent/audio_processor.c
+  (has audio_recorder_open/read, audio_playback_open/feed using esp_codec_dev)
+- Audio peripheral setup: components/brookesia_core/ai_framework/agent/esp_gmf_setup_peripheral.c
+  (I2S + codec initialization for ES8311/ES7210)
+
+PROMPT TO BUILD THE WATCH APP:
+---
+Build a "Voice Assistant" app for an ESP32-S3 watch running esp-brookesia (LVGL 9.2
+phone-like framework on ESP-IDF 5.4).
+
+The app should:
+
+1. REGISTER AS A BROOKESIA APP
+   - Create voice_assistant.cpp and voice_assistant.h in firmware/esp-brookesia/main/
+   - Subclass esp_brookesia::systems::phone::App (same pattern as SettingsApp in
+     components/brookesia_app_settings/esp_brookesia_app_settings.cpp)
+   - Register it in main.cpp via phone->initAppFromRegistry() so it shows in the
+     app launcher with an icon
+
+2. BLE GATT SERVICE
+   - Use ESP-IDF Bluedroid API (already enabled in sdkconfig: CONFIG_BT_ENABLED,
+     CONFIG_BT_BLUEDROID_ENABLED, CONFIG_BT_BLE_ENABLED, CONFIG_BT_GATTS_ENABLE)
+   - Create a custom GATT service with UUID: 0000AA00-0000-1000-8000-00805F9B34FB
+   - Characteristic 1 — Audio Stream (UUID: 0000AA01-...):
+     - Properties: NOTIFY
+     - Used to stream mic audio chunks to the connected iPhone
+   - Characteristic 2 — Text Response (UUID: 0000AA02-...):
+     - Properties: WRITE
+     - iPhone writes AI response text here, watch reads and displays it
+   - Negotiate MTU to 512 for efficient audio transfer
+   - Advertise as "QuantumWatch" with the custom service UUID
+
+3. AUDIO CAPTURE
+   - Initialize mic using BSP APIs:
+     bsp_audio_init(NULL) → bsp_audio_codec_speaker_init() to get esp_codec_dev_handle_t
+   - OR use the audio_processor.c pattern: audio_manager_init() with hardware info
+     from the Waveshare BSP, then audio_recorder_open() / audio_recorder_read_data()
+   - Capture 16kHz, 16-bit mono PCM audio
+   - Compress to 8-bit ADPCM (IMA-ADPCM) to fit BLE bandwidth (~8 KB/s vs 32 KB/s raw)
+   - Stream compressed audio in chunks (240 bytes per BLE notification at MTU 512)
+
+4. UI (LVGL 9.2)
+   - Main screen: centered mic button (large circle, gold accent #CCA427)
+   - States:
+     a) IDLE: "Tap to speak" text, mic icon
+     b) LISTENING: pulsing red ring around mic button, "Listening..." text
+     c) PROCESSING: spinner animation, "Processing..." text
+     d) RESPONSE: scrollable text area showing the AI response, with a
+        "New question" button to go back to IDLE
+   - BLE status indicator: small dot top-right (green=connected, gray=disconnected)
+   - Use lv_obj_set_style_* for styling, lv_anim_* for pulse animation
+   - Screen size: 410x502, dark background matching the watch theme
+
+5. FLOW
+   - On app launch: start BLE advertising if not already connected
+   - User taps mic → start audio capture → stream via BLE NOTIFY on Audio characteristic
+   - User taps mic again (or silence detected) → stop capture, send end-of-audio marker
+     (empty notification or special byte sequence 0xFF 0xFF 0xFF 0xFF)
+   - Wait for iPhone to write text to Text Response characteristic
+   - Display received text on screen
+   - Handle BLE disconnect gracefully (show "Disconnected" status, stop recording)
+
+6. FILES TO CREATE/MODIFY
+   - NEW: main/voice_assistant.cpp — app logic, BLE service, audio capture
+   - NEW: main/voice_assistant.h — public API (init, app class declaration)
+   - MODIFY: main/CMakeLists.txt — add voice_assistant.cpp to SRCS
+   - MODIFY: main/main.cpp — include header, register app
+   - Audio format: IMA-ADPCM, 16kHz sample rate, mono
+   - BLE audio packet format: [2-byte sequence number][238-byte ADPCM data]
+---
+
+
+================================================================================
+SECTION 2: iOS APP (Swift / CoreBluetooth)
+================================================================================
+
+PROMPT TO BUILD THE iOS APP:
+---
+Build an iOS app in Swift (SwiftUI) that acts as a BLE companion for a voice
+assistant running on an ESP32-S3 smartwatch.
+
+The app should:
+
+1. PROJECT SETUP
+   - Xcode project, iOS 16+ deployment target
+   - Name: "QuantumWatch Companion"
+   - Bundle ID: com.quantumwatch.companion
+   - Required capabilities:
+     - Background Modes: "Uses Bluetooth LE accessories"
+     - Privacy - Microphone Usage Description (not needed, mic is on the watch)
+     - Privacy - Bluetooth Always Usage Description
+   - No external dependencies — use only Apple frameworks
+
+2. BLE CONNECTION (CoreBluetooth)
+   - Act as BLE Central using CBCentralManager
+   - Scan for peripherals advertising service UUID: 0000AA00-0000-1000-8000-00805F9B34FB
+   - Auto-connect to "QuantumWatch" peripheral
+   - Discover and subscribe to:
+     - Audio Stream characteristic (UUID: 0000AA01-...): subscribe to notifications
+     - Text Response characteristic (UUID: 0000AA02-...): for writing responses
+   - Request MTU 512 via maximumWriteValueLength
+   - Handle reconnection: when peripheral disconnects, automatically re-scan and reconnect
+   - Maintain connection in background mode
+
+3. AUDIO RECEPTION & DECODING
+   - Receive ADPCM audio chunks via BLE notifications from Audio Stream characteristic
+   - Packet format: [2-byte little-endian sequence number][238-byte IMA-ADPCM data]
+   - Decode IMA-ADPCM to 16-bit PCM (16kHz, mono)
+   - Buffer decoded PCM into a complete audio recording
+   - Detect end-of-audio marker: notification payload of 0xFF 0xFF 0xFF 0xFF
+   - Handle out-of-order packets using sequence numbers
+
+4. SPEECH-TO-TEXT
+   - Use Apple's Speech framework (SFSpeechRecognizer) to transcribe the decoded PCM audio
+   - OR optionally use OpenAI Whisper API (provide a settings screen for API key)
+   - After transcription, optionally send the text to an LLM:
+     - OpenAI ChatGPT API (GPT-4o-mini for speed)
+     - Settings screen for API key and model selection
+     - System prompt: "You are a helpful smartwatch assistant. Keep responses
+       concise (under 100 words) since they display on a small watch screen."
+   - If no LLM configured, just return the transcription as-is
+
+5. SEND RESPONSE TO WATCH
+   - Write the response text (UTF-8 encoded) to the Text Response characteristic
+     (UUID: 0000AA02-...)
+   - If response exceeds BLE MTU, split into chunks:
+     - Format: [1-byte flags (0x00=more, 0x01=final)][remaining bytes = text chunk]
+   - Write with response (CBCharacteristicWriteType.withResponse) for reliability
+
+6. UI (SwiftUI)
+   - Main screen:
+     a) Connection status card: "Connected to QuantumWatch" / "Scanning..." / "Disconnected"
+        with colored indicator dot
+     b) Activity log: scrollable list showing timestamped entries:
+        - "Receiving audio..." (with progress)
+        - "Transcribing..."
+        - "Transcription: <text>"
+        - "AI response: <text>"
+        - "Sent to watch ✓"
+     c) Large status text showing current state
+   - Settings screen (gear icon in nav bar):
+     a) OpenAI API key text field (stored in Keychain)
+     b) Model picker: GPT-4o-mini, GPT-4o, GPT-4-turbo
+     c) Toggle: "Use Apple Speech" vs "Use Whisper API"
+     d) Whisper API key field (if Whisper selected)
+   - Use dark theme to match the watch aesthetic
+
+7. ARCHITECTURE
+   - BLEManager: ObservableObject managing CBCentralManager, scanning, connection,
+     characteristic discovery, notifications, writes
+   - AudioDecoder: Decodes IMA-ADPCM packets to PCM buffer
+   - SpeechService: Protocol with two implementations:
+     - AppleSpeechService (SFSpeechRecognizer)
+     - WhisperService (OpenAI Whisper API)
+   - AIService: Sends transcribed text to OpenAI Chat API, returns response
+   - VoiceAssistantViewModel: Coordinates the pipeline:
+     BLE audio → decode → transcribe → AI → send response
+
+8. FLOW
+   - App launches → start scanning for QuantumWatch
+   - Connect when found → subscribe to Audio characteristic
+   - When audio notifications arrive → buffer ADPCM data, decode to PCM
+   - When end-of-audio marker received:
+     1. Run speech-to-text on the complete PCM buffer
+     2. Send transcription to AI service (if configured)
+     3. Write response text to Text Response characteristic on watch
+   - Display all steps in the activity log with timestamps
+---
+
+
+================================================================================
+BLE PROTOCOL SUMMARY (shared between both apps)
+================================================================================
+
+Service UUID:       0000AA00-0000-1000-8000-00805F9B34FB
+Audio Char UUID:    0000AA01-0000-1000-8000-00805F9B34FB  (NOTIFY, watch → iPhone)
+Text Char UUID:     0000AA02-0000-1000-8000-00805F9B34FB  (WRITE,  iPhone → watch)
+
+Audio packet:       [uint16_le seq_num][uint8[] adpcm_data]  (up to 240 bytes total)
+End-of-audio:       [0xFF, 0xFF, 0xFF, 0xFF]
+Text response:      [uint8 flags][uint8[] utf8_text]  (flags: 0x00=more, 0x01=final)
+
+Audio format:       IMA-ADPCM, 16kHz sample rate, mono, ~8 KB/s
+Decoded PCM:        16-bit signed, 16kHz, mono, little-endian
+
+MTU:                512 (negotiated)
+Advertising name:   "QuantumWatch"

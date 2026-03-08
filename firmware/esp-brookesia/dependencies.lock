@@ -2,7 +2,7 @@ dependencies:
   brookesia_core:
     dependencies: []
     source:
-      path: /Users/dushyant/Projects/Personal/ESP32-S3-Touch-AMOLED-2.06/examples/ESP-IDF-v5.4.2/03_esp-brookesia/components/brookesia_core
+      path: /Users/dushyant/Projects/Personal/quantum-watch/firmware/esp-brookesia/components/brookesia_core
       type: local
     version: 0.6.0-beta2
   espressif/cmake_utilities:
@@ -369,6 +369,6 @@ direct_dependencies:
 - idf
 - lvgl/lvgl
 - waveshare/esp32_s3_touch_amoled_2_06
-manifest_hash: b7f5e76f46d1da7e2bcfc5a71c585d0f0d907c11fba54238280f0217f9b1fbb2
+manifest_hash: ede9dcb625053e7e985e40742b692500a59a452dee7c6d88fb9c15ef5dd9d7c1
 target: esp32s3
 version: 2.0.0

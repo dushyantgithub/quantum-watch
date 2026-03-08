@@ -3,5 +3,8 @@ firmware/esp-brookesia/build/
 firmware/esp-brookesia/managed_components/
 firmware/esp-brookesia/sdkconfig.old
 
+# IDE
+.cursor/
+
 # OS
 .DS_Store
