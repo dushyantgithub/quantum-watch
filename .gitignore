@@ -1,0 +1,7 @@
+# ESP-IDF
+firmware/esp-brookesia/build/
+firmware/esp-brookesia/managed_components/
+firmware/esp-brookesia/sdkconfig.old
+
+# OS
+.DS_Store
