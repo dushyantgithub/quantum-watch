@@ -15,8 +15,13 @@
 #include "./dark/stylesheet.hpp"
 #include "buttons.h"
 #include "away_screen.h"
-#include "esp_sleep.h"
-#include "esp_brookesia_app_settings.hpp"
+#include "esp_system.h"
+#include "voice_assistant.h"
+#include "notifications.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "nvs_flash.h"
+#include "display/lv_display_private.h"
 
 using namespace esp_brookesia;
 using namespace esp_brookesia::gui;
@@ -24,10 +29,10 @@ using namespace esp_brookesia::systems::phone;
 
 #define LVGL_PORT_INIT_CONFIG() \
     {                               \
-        .task_priority = 4,       \
-        .task_stack = 10 * 1024,       \
-        .task_affinity = -1,      \
-        .task_max_sleep_ms = 500, \
+        .task_priority = 5,       \
+        .task_stack = 16 * 1024,       \
+        .task_affinity = 1,       \
+        .task_max_sleep_ms = 10,  \
         .timer_period_ms = 5,     \
     }
 
@@ -35,18 +40,50 @@ using namespace esp_brookesia::systems::phone;
 
 constexpr bool EXAMPLE_SHOW_MEM_INFO = false;
 
+/* ── Flush-wait callback ──
+ * LVGL 9's default wait_for_flushing() does `while(disp->flushing);` — a bare
+ * spin with no timeout.  If the SPI DMA completion ISR is ever delayed or lost
+ * (e.g. interrupt storm on core 0), the LVGL task hangs permanently and triggers
+ * the task watchdog.
+ *
+ * Registering a flush_wait_cb replaces the bare spin.  We spin-poll just like
+ * the original (no latency penalty) but with a 50 ms timeout.  After the
+ * callback returns, LVGL unconditionally clears `flushing = 0`, so recovery is
+ * guaranteed even if the ISR was truly lost. */
+static void display_flush_wait_cb(lv_display_t *disp)
+{
+    /* Spin-poll (same speed as the default bare spin) but with a hard timeout */
+    int64_t deadline = esp_timer_get_time() + 50000; /* 50 ms */
+    while (disp->flushing) {
+        if (esp_timer_get_time() >= deadline) {
+            ESP_LOGW("LVGL", "Flush wait timeout — forcing recovery");
+            break;
+        }
+    }
+}
+
 extern "C" void app_main(void)
 {
     ESP_UTILS_LOGI("Display ESP-Brookesia phone demo");
 
-    /* Auto-connect WiFi and set IST timezone before display init */
-    settings_wifi_boot_connect();
+    /* BLE bonding/config persistence depends on NVS. Settings used to initialize this as a side effect,
+     * so keep it explicit here now that Settings is removed from the build. */
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_err);
 
     bsp_display_cfg_t cfg = {
         .lvgl_port_cfg = LVGL_PORT_INIT_CONFIG(),
     };
-    ESP_UTILS_CHECK_NULL_EXIT(bsp_display_start_with_config(&cfg), "Start display failed");
+    lv_display_t *disp = bsp_display_start_with_config(&cfg);
+    ESP_UTILS_CHECK_NULL_EXIT(disp, "Start display failed");
     ESP_UTILS_CHECK_ERROR_EXIT(bsp_display_backlight_on(), "Turn on display backlight failed");
+
+    /* Replace LVGL's bare-spin flush wait with a safe timeout-based callback */
+    lv_display_set_flush_wait_cb(disp, display_flush_wait_cb);
 
     /* Configure GUI lock */
     LvLock::registerCallbacks([](int timeout_ms) {
@@ -92,18 +129,6 @@ extern "C" void app_main(void)
         ESP_UTILS_CHECK_FALSE_EXIT(phone->initAppFromRegistry(inited_apps), "Init app registry failed");
         ESP_UTILS_CHECK_FALSE_EXIT(phone->installAppFromRegistry(inited_apps), "Install app registry failed");
 
-        /* Apply a subtle dark gradient on the homescreen background.
-         * Uses LVGL's native gradient rendering (zero image bytes in flash). */
-        {
-            lv_obj_t *main_obj = lv_obj_get_child(lv_screen_active(), 0);
-            if (main_obj) {
-                lv_obj_set_style_bg_color(main_obj, lv_color_hex(0x121C30), 0);
-                lv_obj_set_style_bg_grad_color(main_obj, lv_color_hex(0x1A1A1A), 0);
-                lv_obj_set_style_bg_grad_dir(main_obj, LV_GRAD_DIR_VER, 0);
-                lv_obj_set_style_bg_opa(main_obj, LV_OPA_COVER, 0);
-            }
-        }
-
         /* Create a timer to update the clock */
         lv_timer_create([](lv_timer_t *t) {
             time_t now;
@@ -124,6 +149,9 @@ extern "C" void app_main(void)
         /* Initialize the away screen overlay */
         away_screen_init();
 
+        /* Initialize notification system (call overlay + drawer) */
+        notifications_init();
+
         /* Inactivity timer: show away screen after AWAY_TIMEOUT_MS of no interaction */
         lv_timer_create([](lv_timer_t *t) {
             (void)t;
@@ -137,6 +165,9 @@ extern "C" void app_main(void)
         }, 2000, NULL);
     }
 
+    /* Start BLE advertising at boot so iPhone can discover the watch immediately */
+    esp_brookesia::apps::va_init_ble();
+
     /* Initialize physical buttons: BOOT and PWR */
     ESP_UTILS_CHECK_ERROR_EXIT(buttons_init(), "Buttons init failed");
 
@@ -149,23 +180,34 @@ extern "C" void app_main(void)
         }
     }, phone);
 
-    /* BOOT: short press -> toggle screen on/off */
+    /* PWR: long press -> open Voice Assistant */
+    buttons_register_pwr_long_cb([](void *user_data) {
+        Phone *p = (Phone *)user_data;
+        auto *va = esp_brookesia::apps::VoiceAssistantApp::requestInstance();
+        if (p && va) {
+            LvLockGuard gui_guard;
+            systems::base::Context::AppEventData evt = {
+                .id = va->getId(),
+                .type = systems::base::Context::AppEventType::START,
+            };
+            p->sendAppEvent(&evt);
+        }
+    }, phone);
+
+    /* BOOT: short press -> show away screen */
     buttons_register_boot_short_cb([](void *user_data) {
         (void)user_data;
-        int b = bsp_display_brightness_get();
-        if (b > 0) {
-            bsp_display_backlight_off();
-        } else {
-            bsp_display_backlight_on();
+        if (!away_screen_is_active()) {
+            away_screen_show();
+            buttons_set_away_mode(true);
         }
     }, NULL);
 
-    /* BOOT: long press -> shutdown (deep sleep). Wake by pressing BOOT again. */
+    /* BOOT: long press -> restart the watch */
     buttons_register_boot_long_cb([](void *user_data) {
         (void)user_data;
-        ESP_UTILS_LOGI("BOOT long press: entering deep sleep (shutdown)");
-        esp_sleep_enable_ext0_wakeup(BUTTON_BOOT_GPIO, 0);
-        esp_deep_sleep_start();
+        ESP_UTILS_LOGI("BOOT long press: restarting watch");
+        esp_restart();
     }, NULL);
 
     /* Wake callback: dismiss away screen on button press while in away mode */

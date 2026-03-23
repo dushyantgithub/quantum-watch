@@ -6,10 +6,10 @@ from PIL import Image, ImageFilter, ImageEnhance
 
 INPUT = "/Users/dushyant/.cursor/projects/Users-dushyant-Projects-Personal/assets/alessio-soggetti-IOhH65el-no-unsplash-f9919479-5e92-425e-b46b-cc951b98fe29.png"
 OUTPUT = "/Users/dushyant/Projects/Personal/quantum-watch/firmware/esp-brookesia/main/bg_image.c"
-TARGET_W = 205
-TARGET_H = 251
-BLUR_RADIUS = 12
-DARKEN_FACTOR = 0.45
+TARGET_W = 410
+TARGET_H = 502
+BLUR_RADIUS = 20
+DARKEN_FACTOR = 0.40
 
 img = Image.open(INPUT).convert("RGB")
 
@@ -45,7 +45,7 @@ stride = TARGET_W * 2
 with open(OUTPUT, "w") as f:
     f.write('#include "lvgl.h"\n\n')
     f.write(f"/* Blurred mountain sunset background {TARGET_W}x{TARGET_H} RGB565 */\n")
-    f.write(f"static const uint8_t bg_image_map[] = {{\n")
+    f.write(f"static const LV_ATTRIBUTE_MEM_ALIGN LV_ATTRIBUTE_LARGE_CONST uint8_t bg_image_map[] = {{\n")
     for i in range(0, len(rgb565_data), 16):
         chunk = rgb565_data[i:i+16]
         f.write("    " + ",".join(f"0x{b:02x}" for b in chunk) + ",\n")

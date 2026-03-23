@@ -213,6 +213,7 @@ struct SettingsAppPrivate {
 
     esp_codec_dev_handle_t audio_handle = nullptr;
     bool audio_inited = false;
+    lv_obj_t *detail_screen = nullptr;
     bool wifi_subsys_inited = false;
     bool wifi_started = false;
     bool wifi_connecting = false;
@@ -224,6 +225,45 @@ struct SettingsAppPrivate {
 static SettingsAppPrivate *s_priv = nullptr;
 static bool s_wifi_hw_inited = false;
 static bool s_ntp_started = false;
+
+/* Singleton app: LVGL objects are deleted on screen unload but s_priv kept dangling pointers.
+ * WiFi scan / deferred timers / system events can still fire — guard with attachment + detach on close. */
+static bool settings_lv_attached(void)
+{
+    return s_priv && s_priv->main_list_cont && lv_obj_is_valid(s_priv->main_list_cont);
+}
+
+static void settings_lv_detach_all(void)
+{
+    if (!s_priv) {
+        return;
+    }
+    s_priv->main_list_cont = nullptr;
+    s_priv->detail_cont = nullptr;
+    s_priv->detail_display = nullptr;
+    s_priv->detail_sound = nullptr;
+    s_priv->detail_wifi = nullptr;
+    s_priv->detail_bt = nullptr;
+    s_priv->detail_battery = nullptr;
+    s_priv->brightness_slider = nullptr;
+    s_priv->brightness_label = nullptr;
+    s_priv->volume_slider = nullptr;
+    s_priv->volume_label = nullptr;
+    s_priv->wifi_switch = nullptr;
+    s_priv->wifi_status_label = nullptr;
+    s_priv->wifi_list = nullptr;
+    s_priv->bt_switch = nullptr;
+    s_priv->bt_status_label = nullptr;
+    s_priv->bt_list = nullptr;
+    s_priv->battery_charge_label = nullptr;
+    s_priv->battery_status_label = nullptr;
+    s_priv->pwd_modal = nullptr;
+    s_priv->pwd_textarea = nullptr;
+    s_priv->pwd_keyboard = nullptr;
+    s_priv->wifi_error_popup = nullptr;
+    s_priv->detail_screen = nullptr;
+    s_priv->current_detail = DETAIL_NONE;
+}
 
 static void start_ntp_sync(void)
 {
@@ -248,6 +288,11 @@ static void save_wifi_state(bool on, const char *ssid)
 
 static void battery_timer_start(void);
 static void battery_timer_stop(void);
+static void ensure_detail_display(void);
+static void ensure_detail_sound(void);
+static void ensure_detail_wifi(void);
+static void ensure_detail_bt(void);
+static void ensure_detail_battery(void);
 
 static void apply_brightness(int percent)
 {
@@ -475,74 +520,84 @@ static bool wifi_ensure_subsys_init(void)
     return true;
 }
 
-static void wifi_toggle_timer_cb(lv_timer_t *t)
+/* WiFi toggle runs blocking WiFi ops in a FreeRTOS task to avoid freezing the LVGL render loop */
+static void wifi_toggle_task_fn(void *arg)
 {
-    bool on = (bool)(uintptr_t)t->user_data;
-    lv_timer_del(t);
-
-    if (!s_priv) { return; }
+    bool on = (bool)(uintptr_t)arg;
 
     if (on) {
         if (!wifi_ensure_subsys_init()) {
-            if (s_priv->wifi_status_label) {
-                lv_label_set_text(s_priv->wifi_status_label, "WiFi init failed");
+            LvLockGuard gui_guard;
+            if (s_priv && settings_lv_attached()) {
+                if (s_priv->wifi_status_label) lv_label_set_text(s_priv->wifi_status_label, "WiFi init failed");
+                if (s_priv->wifi_switch) lv_obj_remove_state(s_priv->wifi_switch, LV_STATE_CHECKED);
             }
-            if (s_priv->wifi_switch) {
-                lv_obj_remove_state(s_priv->wifi_switch, LV_STATE_CHECKED);
-            }
+            vTaskDelete(nullptr);
             return;
         }
 
         esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
         if (err != ESP_OK) {
             ESP_UTILS_LOGW("WiFi set mode failed: %s", esp_err_to_name(err));
-            if (s_priv->wifi_status_label) {
-                lv_label_set_text(s_priv->wifi_status_label, "WiFi start failed");
+            LvLockGuard gui_guard;
+            if (s_priv && settings_lv_attached()) {
+                if (s_priv->wifi_status_label) lv_label_set_text(s_priv->wifi_status_label, "WiFi start failed");
+                if (s_priv->wifi_switch) lv_obj_remove_state(s_priv->wifi_switch, LV_STATE_CHECKED);
             }
-            if (s_priv->wifi_switch) {
-                lv_obj_remove_state(s_priv->wifi_switch, LV_STATE_CHECKED);
-            }
+            vTaskDelete(nullptr);
             return;
         }
 
-        if (!s_priv->wifi_started) {
+        if (s_priv && !s_priv->wifi_started) {
             err = esp_wifi_start();
             if (err != ESP_OK) {
                 ESP_UTILS_LOGW("WiFi start failed: %s", esp_err_to_name(err));
-                if (s_priv->wifi_status_label) {
-                    lv_label_set_text(s_priv->wifi_status_label, "WiFi start failed");
+                LvLockGuard gui_guard;
+                if (s_priv && settings_lv_attached()) {
+                    if (s_priv->wifi_status_label) lv_label_set_text(s_priv->wifi_status_label, "WiFi start failed");
+                    if (s_priv->wifi_switch) lv_obj_remove_state(s_priv->wifi_switch, LV_STATE_CHECKED);
                 }
-                if (s_priv->wifi_switch) {
-                    lv_obj_remove_state(s_priv->wifi_switch, LV_STATE_CHECKED);
-                }
+                vTaskDelete(nullptr);
                 return;
             }
-            s_priv->wifi_started = true;
+            if (s_priv) s_priv->wifi_started = true;
         }
 
-        if (s_priv->wifi_status_label) {
-            lv_label_set_text(s_priv->wifi_status_label, "Scanning...");
-        }
-        if (s_priv->wifi_list) {
-            lv_obj_remove_flag(s_priv->wifi_list, LV_OBJ_FLAG_HIDDEN);
+        {
+            LvLockGuard gui_guard;
+            if (s_priv && settings_lv_attached()) {
+                if (s_priv->wifi_status_label) lv_label_set_text(s_priv->wifi_status_label, "Scanning...");
+                if (s_priv->wifi_list) lv_obj_remove_flag(s_priv->wifi_list, LV_OBJ_FLAG_HIDDEN);
+            }
         }
         esp_wifi_scan_start(NULL, false);
     } else {
-        if (s_priv->wifi_started) {
+        if (s_priv && s_priv->wifi_started) {
             esp_wifi_stop();
             s_priv->wifi_started = false;
         }
-        s_priv->wifi_connected_ssid.clear();
+        if (s_priv) s_priv->wifi_connected_ssid.clear();
+
+        LvLockGuard gui_guard;
         update_status_bar_wifi(false);
         save_wifi_state(false, nullptr);
-        if (s_priv->wifi_status_label) {
-            lv_label_set_text(s_priv->wifi_status_label, "Please switch on the WiFi");
-        }
-        if (s_priv->wifi_list) {
-            lv_obj_clean(s_priv->wifi_list);
-            lv_obj_add_flag(s_priv->wifi_list, LV_OBJ_FLAG_HIDDEN);
+        if (s_priv && settings_lv_attached()) {
+            if (s_priv->wifi_status_label) lv_label_set_text(s_priv->wifi_status_label, "Please switch on the WiFi");
+            if (s_priv->wifi_list) {
+                lv_obj_clean(s_priv->wifi_list);
+                lv_obj_add_flag(s_priv->wifi_list, LV_OBJ_FLAG_HIDDEN);
+            }
         }
     }
+    vTaskDelete(nullptr);
+}
+
+static void wifi_toggle_timer_cb(lv_timer_t *t)
+{
+    bool on = (bool)(uintptr_t)t->user_data;
+    lv_timer_del(t);
+    /* Spawn a task so WiFi blocking calls don't freeze the display */
+    xTaskCreatePinnedToCore(wifi_toggle_task_fn, "wifi_tog", 4096, (void *)(uintptr_t)on, 3, nullptr, 0);
 }
 
 static void on_wifi_switch_changed(lv_event_t *e)
@@ -589,7 +644,9 @@ static void wifi_scan_done_cb(void *arg, esp_event_base_t base, int32_t id, void
 {
     if (id != WIFI_EVENT_SCAN_DONE) { return; }
     LvLockGuard gui_guard;
-    if (!s_priv || !s_priv->wifi_list) { return; }
+    if (!s_priv || !settings_lv_attached() || !s_priv->wifi_list || !lv_obj_is_valid(s_priv->wifi_list)) {
+        return;
+    }
     lv_obj_clean(s_priv->wifi_list);
     uint16_t ap_count = 0;
     esp_wifi_scan_get_ap_num(&ap_count);
@@ -646,6 +703,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         LvLockGuard gui_guard;
         if (!s_priv) { return; }
         update_status_bar_wifi(false);
+        const bool ui = settings_lv_attached();
         if (s_priv->wifi_connecting) {
             /* User-initiated connection attempt failed */
             s_priv->wifi_connecting = false;
@@ -656,17 +714,19 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
                                    reason == WIFI_REASON_AUTH_FAIL ||
                                    reason == WIFI_REASON_HANDSHAKE_TIMEOUT ||
                                    reason == WIFI_REASON_MIC_FAILURE);
-            if (wrong_password) {
-                show_wifi_error_popup("Incorrect password");
-            } else {
-                show_wifi_error_popup("Connection failed");
+            if (ui) {
+                if (wrong_password) {
+                    show_wifi_error_popup("Incorrect password");
+                } else {
+                    show_wifi_error_popup("Connection failed");
+                }
             }
-            if (s_priv->wifi_status_label) {
+            if (ui && s_priv->wifi_status_label && lv_obj_is_valid(s_priv->wifi_status_label)) {
                 lv_label_set_text(s_priv->wifi_status_label, "Select a network");
             }
         } else if (!s_priv->wifi_connected_ssid.empty()) {
             /* Was connected but dropped -- boot handler will auto-reconnect */
-            if (s_priv->wifi_status_label) {
+            if (ui && s_priv->wifi_status_label && lv_obj_is_valid(s_priv->wifi_status_label)) {
                 lv_label_set_text(s_priv->wifi_status_label, "Reconnecting...");
             }
         }
@@ -682,20 +742,23 @@ static void ip_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
     s_priv->wifi_connecting = false;
     update_status_bar_wifi(true);
     save_wifi_state(true, s_priv->wifi_connected_ssid.c_str());
-    if (s_priv->wifi_status_label) {
-        char buf[64];
-        if (!s_priv->wifi_connected_ssid.empty()) {
-            lv_snprintf(buf, sizeof(buf), "Connected: %s", s_priv->wifi_connected_ssid.c_str());
-        } else {
-            lv_snprintf(buf, sizeof(buf), "Connected");
-        }
-        lv_label_set_text(s_priv->wifi_status_label, buf);
+    if (!settings_lv_attached() || !s_priv->wifi_status_label || !lv_obj_is_valid(s_priv->wifi_status_label)) {
+        return;
     }
+    char buf[64];
+    if (!s_priv->wifi_connected_ssid.empty()) {
+        lv_snprintf(buf, sizeof(buf), "Connected: %s", s_priv->wifi_connected_ssid.c_str());
+    } else {
+        lv_snprintf(buf, sizeof(buf), "Connected");
+    }
+    lv_label_set_text(s_priv->wifi_status_label, buf);
 }
 
 static void show_wifi_error_popup(const char *msg)
 {
-    if (!s_priv) { return; }
+    if (!s_priv || !settings_lv_attached()) {
+        return;
+    }
     lv_obj_t *scr = lv_scr_act();
     if (!scr) { return; }
 
@@ -945,6 +1008,7 @@ static void show_detail(DetailId id)
     s_priv->current_detail = id;
     if (s_priv->main_list_cont) { lv_obj_add_flag(s_priv->main_list_cont, LV_OBJ_FLAG_HIDDEN); }
     if (s_priv->detail_cont) { lv_obj_remove_flag(s_priv->detail_cont, LV_OBJ_FLAG_HIDDEN); }
+    /* Hide all existing panels */
     if (s_priv->detail_display) { lv_obj_add_flag(s_priv->detail_display, LV_OBJ_FLAG_HIDDEN); }
     if (s_priv->detail_sound) { lv_obj_add_flag(s_priv->detail_sound, LV_OBJ_FLAG_HIDDEN); }
     if (s_priv->detail_wifi) { lv_obj_add_flag(s_priv->detail_wifi, LV_OBJ_FLAG_HIDDEN); }
@@ -953,12 +1017,26 @@ static void show_detail(DetailId id)
         lv_obj_add_flag(s_priv->detail_battery, LV_OBJ_FLAG_HIDDEN);
         battery_timer_stop();
     }
+    /* Create only the requested panel (if not already created), then show it */
     switch (id) {
-        case DETAIL_DISPLAY:  if (s_priv->detail_display)  lv_obj_remove_flag(s_priv->detail_display,  LV_OBJ_FLAG_HIDDEN); break;
-        case DETAIL_SOUND:   if (s_priv->detail_sound)   lv_obj_remove_flag(s_priv->detail_sound,   LV_OBJ_FLAG_HIDDEN); break;
-        case DETAIL_WIFI:    if (s_priv->detail_wifi)   lv_obj_remove_flag(s_priv->detail_wifi,   LV_OBJ_FLAG_HIDDEN); break;
-        case DETAIL_BLUETOOTH: if (s_priv->detail_bt)    lv_obj_remove_flag(s_priv->detail_bt,    LV_OBJ_FLAG_HIDDEN); break;
+        case DETAIL_DISPLAY:
+            ensure_detail_display();
+            if (s_priv->detail_display) lv_obj_remove_flag(s_priv->detail_display, LV_OBJ_FLAG_HIDDEN);
+            break;
+        case DETAIL_SOUND:
+            ensure_detail_sound();
+            if (s_priv->detail_sound) lv_obj_remove_flag(s_priv->detail_sound, LV_OBJ_FLAG_HIDDEN);
+            break;
+        case DETAIL_WIFI:
+            ensure_detail_wifi();
+            if (s_priv->detail_wifi) lv_obj_remove_flag(s_priv->detail_wifi, LV_OBJ_FLAG_HIDDEN);
+            break;
+        case DETAIL_BLUETOOTH:
+            ensure_detail_bt();
+            if (s_priv->detail_bt) lv_obj_remove_flag(s_priv->detail_bt, LV_OBJ_FLAG_HIDDEN);
+            break;
         case DETAIL_BATTERY:
+            ensure_detail_battery();
             if (s_priv->detail_battery) {
                 lv_obj_remove_flag(s_priv->detail_battery, LV_OBJ_FLAG_HIDDEN);
                 battery_timer_start();
@@ -1027,27 +1105,57 @@ static bool battery_read_axp2101(BatteryInfo *out)
     return true;
 }
 
+/* Battery info is read in a FreeRTOS task to avoid blocking the LVGL timer loop
+ * with I2C transactions. The task writes to these atomics and the LVGL timer reads them. */
+static volatile int  s_bat_percent = -1;
+static volatile bool s_bat_charging = false;
+static volatile bool s_bat_available = false;
+static volatile bool s_bat_ready = false;
+static TaskHandle_t  s_battery_read_task = nullptr;
+
+static void battery_read_task_fn(void *arg)
+{
+    (void)arg;
+    BatteryInfo info = {};
+    battery_read_axp2101(&info);
+    s_bat_percent = info.percent;
+    s_bat_charging = info.charging;
+    s_bat_available = info.available;
+    s_bat_ready = true;
+    s_battery_read_task = nullptr;
+    vTaskDelete(nullptr);
+}
+
 static void battery_timer_cb(lv_timer_t *t)
 {
     (void)t;
     if (!s_priv || s_priv->current_detail != DETAIL_BATTERY) { return; }
     if (!s_priv->battery_charge_label || !s_priv->battery_status_label) { return; }
+    if (!lv_obj_is_valid(s_priv->battery_charge_label) || !lv_obj_is_valid(s_priv->battery_status_label)) {
+        return;
+    }
 
-    BatteryInfo info = {};
-    battery_read_axp2101(&info);
+    /* Update UI if a read result is available */
+    if (s_bat_ready) {
+        s_bat_ready = false;
+        if (s_bat_available) {
+            char buf[32];
+            lv_snprintf(buf, sizeof(buf), "Charge: %d%%", (int)s_bat_percent);
+            lv_label_set_text(s_priv->battery_charge_label, buf);
+            lv_obj_set_style_text_color(s_priv->battery_charge_label, lv_color_hex(COLOR_TEXT), 0);
+            lv_label_set_text(s_priv->battery_status_label, s_bat_charging ? "Status: Charging" : "Status: Not charging");
+            lv_obj_set_style_text_color(s_priv->battery_status_label, lv_color_hex(s_bat_charging ? COLOR_ACCENT_GREEN : COLOR_TEXT_SECONDARY), 0);
+        } else {
+            lv_label_set_text(s_priv->battery_charge_label, "Charge: --%");
+            lv_obj_set_style_text_color(s_priv->battery_charge_label, lv_color_hex(COLOR_TEXT_SECONDARY), 0);
+            lv_label_set_text(s_priv->battery_status_label, "Status: Not available");
+            lv_obj_set_style_text_color(s_priv->battery_status_label, lv_color_hex(COLOR_TEXT_SECONDARY), 0);
+        }
+    }
 
-    if (info.available) {
-        char buf[32];
-        lv_snprintf(buf, sizeof(buf), "Charge: %d%%", info.percent);
-        lv_label_set_text(s_priv->battery_charge_label, buf);
-        lv_obj_set_style_text_color(s_priv->battery_charge_label, lv_color_hex(COLOR_TEXT), 0);
-        lv_label_set_text(s_priv->battery_status_label, info.charging ? "Status: Charging" : "Status: Not charging");
-        lv_obj_set_style_text_color(s_priv->battery_status_label, lv_color_hex(info.charging ? COLOR_ACCENT_GREEN : COLOR_TEXT_SECONDARY), 0);
-    } else {
-        lv_label_set_text(s_priv->battery_charge_label, "Charge: --%");
-        lv_obj_set_style_text_color(s_priv->battery_charge_label, lv_color_hex(COLOR_TEXT_SECONDARY), 0);
-        lv_label_set_text(s_priv->battery_status_label, "Status: Not available");
-        lv_obj_set_style_text_color(s_priv->battery_status_label, lv_color_hex(COLOR_TEXT_SECONDARY), 0);
+    /* Kick off a new I2C read in a background task (if not already running) */
+    if (!s_battery_read_task) {
+        xTaskCreatePinnedToCore(battery_read_task_fn, "bat_rd", 2048, nullptr, 2, &s_battery_read_task, 0);
     }
 }
 
@@ -1110,10 +1218,11 @@ static void create_main_list(lv_obj_t *screen)
     create_list_item_row(cont, LV_SYMBOL_BATTERY_FULL, "Battery", on_battery_clicked, NULL);
 }
 
-static void create_detail_screens(lv_obj_t *screen)
+static void create_detail_container(lv_obj_t *screen)
 {
     lv_obj_t *detail_cont = lv_obj_create(screen);
     s_priv->detail_cont = detail_cont;
+    s_priv->detail_screen = screen;
     lv_obj_set_size(detail_cont, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(detail_cont, lv_color_hex(COLOR_BG), 0);
     lv_obj_set_style_border_width(detail_cont, 0, 0);
@@ -1122,72 +1231,75 @@ static void create_detail_screens(lv_obj_t *screen)
     lv_obj_set_flex_flow(detail_cont, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(detail_cont, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
     lv_obj_add_flag(detail_cont, LV_OBJ_FLAG_HIDDEN);
+}
 
-    /* --- Display detail --- */
-    lv_obj_t *d_display = lv_obj_create(detail_cont);
-    s_priv->detail_display = d_display;
-    lv_obj_set_size(d_display, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_opa(d_display, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(d_display, 0, 0);
-    lv_obj_set_style_outline_width(d_display, 0, 0);
-    lv_obj_set_flex_flow(d_display, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(d_display, 12, 0);
-    lv_obj_add_flag(d_display, LV_OBJ_FLAG_HIDDEN);
-    create_detail_header(d_display, "Display", on_back_clicked);
+/* Helper to create a common detail panel container */
+static lv_obj_t *create_detail_panel(lv_obj_t *parent, bool scrollable = false)
+{
+    lv_obj_t *panel = lv_obj_create(parent);
+    lv_obj_set_size(panel, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_opa(panel, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(panel, 0, 0);
+    lv_obj_set_style_outline_width(panel, 0, 0);
+    lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(panel, 12, 0);
+    if (scrollable) {
+        lv_obj_set_scrollbar_mode(panel, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_set_scroll_dir(panel, LV_DIR_VER);
+    }
+    lv_obj_add_flag(panel, LV_OBJ_FLAG_HIDDEN);
+    return panel;
+}
+
+/* Create individual detail panels on demand — avoids creating all 5 at once */
+static void ensure_detail_display(void)
+{
+    if (!s_priv || s_priv->detail_display) return;
+    lv_obj_t *d = create_detail_panel(s_priv->detail_cont);
+    s_priv->detail_display = d;
+    create_detail_header(d, "Display", on_back_clicked);
     int br = get_brightness_from_nvs();
-    s_priv->brightness_label = lv_label_create(d_display);
-    s_priv->brightness_slider = lv_slider_create(d_display);
+    s_priv->brightness_label = lv_label_create(d);
+    s_priv->brightness_slider = lv_slider_create(d);
     lv_slider_set_range(s_priv->brightness_slider, 0, SLIDER_RANGE);
     lv_slider_set_value(s_priv->brightness_slider, br, LV_ANIM_OFF);
     lv_obj_set_width(s_priv->brightness_slider, lv_pct(95));
     lv_obj_add_event_cb(s_priv->brightness_slider, on_brightness_changed, LV_EVENT_VALUE_CHANGED, NULL);
     update_brightness_label(s_priv->brightness_label, br);
-    apply_brightness(br);
+}
 
-    /* --- Sound detail --- */
-    lv_obj_t *d_sound = lv_obj_create(detail_cont);
-    s_priv->detail_sound = d_sound;
-    lv_obj_set_size(d_sound, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_opa(d_sound, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(d_sound, 0, 0);
-    lv_obj_set_style_outline_width(d_sound, 0, 0);
-    lv_obj_set_flex_flow(d_sound, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(d_sound, 12, 0);
-    lv_obj_add_flag(d_sound, LV_OBJ_FLAG_HIDDEN);
-    create_detail_header(d_sound, "Sound", on_back_clicked);
+static void ensure_detail_sound(void)
+{
+    if (!s_priv || s_priv->detail_sound) return;
+    lv_obj_t *d = create_detail_panel(s_priv->detail_cont);
+    s_priv->detail_sound = d;
+    create_detail_header(d, "Sound", on_back_clicked);
     int vol = get_volume_from_nvs();
-    s_priv->volume_label = lv_label_create(d_sound);
-    s_priv->volume_slider = lv_slider_create(d_sound);
+    s_priv->volume_label = lv_label_create(d);
+    s_priv->volume_slider = lv_slider_create(d);
     lv_slider_set_range(s_priv->volume_slider, 0, SLIDER_RANGE);
     lv_slider_set_value(s_priv->volume_slider, vol, LV_ANIM_OFF);
     lv_obj_set_width(s_priv->volume_slider, lv_pct(95));
     lv_obj_add_event_cb(s_priv->volume_slider, on_volume_changed, LV_EVENT_VALUE_CHANGED, NULL);
     update_volume_label(s_priv->volume_label, vol);
-    apply_volume(vol);
+}
 
-    /* --- Wi-Fi detail (Apple Watch style like ref image) --- */
-    lv_obj_t *d_wifi = lv_obj_create(detail_cont);
-    s_priv->detail_wifi = d_wifi;
-    lv_obj_set_size(d_wifi, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_opa(d_wifi, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(d_wifi, 0, 0);
-    lv_obj_set_style_outline_width(d_wifi, 0, 0);
-    lv_obj_set_flex_flow(d_wifi, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(d_wifi, 12, 0);
-    lv_obj_set_scrollbar_mode(d_wifi, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_set_scroll_dir(d_wifi, LV_DIR_VER);
-    lv_obj_add_flag(d_wifi, LV_OBJ_FLAG_HIDDEN);
-    create_detail_header(d_wifi, "Wi-Fi", on_back_clicked);
+static void ensure_detail_wifi(void)
+{
+    if (!s_priv || s_priv->detail_wifi) return;
+    lv_obj_t *d = create_detail_panel(s_priv->detail_cont, true);
+    s_priv->detail_wifi = d;
+    create_detail_header(d, "Wi-Fi", on_back_clicked);
 
     bool wifi_already_on = s_priv->wifi_started;
-    s_priv->wifi_switch = create_toggle_row(d_wifi, "Wi-Fi", wifi_already_on, on_wifi_switch_changed, nullptr);
+    s_priv->wifi_switch = create_toggle_row(d, "Wi-Fi", wifi_already_on, on_wifi_switch_changed, nullptr);
 
-    lv_obj_t *section = lv_label_create(d_wifi);
+    lv_obj_t *section = lv_label_create(d);
     lv_label_set_text(section, "CHOOSE NETWORK");
     lv_obj_set_style_text_color(section, lv_color_hex(COLOR_TEXT_SECONDARY), 0);
     lv_obj_set_style_text_font(section, &lv_font_montserrat_12, 0);
 
-    s_priv->wifi_status_label = lv_label_create(d_wifi);
+    s_priv->wifi_status_label = lv_label_create(d);
     if (!s_priv->wifi_connected_ssid.empty()) {
         char buf[64];
         lv_snprintf(buf, sizeof(buf), "Connected: %s", s_priv->wifi_connected_ssid.c_str());
@@ -1199,7 +1311,7 @@ static void create_detail_screens(lv_obj_t *screen)
     }
     lv_obj_set_style_text_color(s_priv->wifi_status_label, lv_color_hex(COLOR_TEXT_SECONDARY), 0);
 
-    s_priv->wifi_list = lv_obj_create(d_wifi);
+    s_priv->wifi_list = lv_obj_create(d);
     lv_obj_set_size(s_priv->wifi_list, lv_pct(100), 180);
     lv_obj_set_style_bg_opa(s_priv->wifi_list, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_priv->wifi_list, 0, 0);
@@ -1209,31 +1321,25 @@ static void create_detail_screens(lv_obj_t *screen)
     lv_obj_set_scrollbar_mode(s_priv->wifi_list, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_scroll_dir(s_priv->wifi_list, LV_DIR_VER);
     lv_obj_add_flag(s_priv->wifi_list, LV_OBJ_FLAG_HIDDEN);
+}
 
-    /* --- Bluetooth detail --- */
-    lv_obj_t *d_bt = lv_obj_create(detail_cont);
-    s_priv->detail_bt = d_bt;
-    lv_obj_set_size(d_bt, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_opa(d_bt, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(d_bt, 0, 0);
-    lv_obj_set_style_outline_width(d_bt, 0, 0);
-    lv_obj_set_flex_flow(d_bt, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(d_bt, 12, 0);
-    lv_obj_set_scrollbar_mode(d_bt, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_set_scroll_dir(d_bt, LV_DIR_VER);
-    lv_obj_add_flag(d_bt, LV_OBJ_FLAG_HIDDEN);
-    create_detail_header(d_bt, "Bluetooth", on_back_clicked);
+static void ensure_detail_bt(void)
+{
+    if (!s_priv || s_priv->detail_bt) return;
+    lv_obj_t *d = create_detail_panel(s_priv->detail_cont, true);
+    s_priv->detail_bt = d;
+    create_detail_header(d, "Bluetooth", on_back_clicked);
 
 #ifdef CONFIG_BT_CLASSIC_ENABLED
-    s_priv->bt_switch = create_toggle_row(d_bt, "Bluetooth", false, on_bt_switch_changed, nullptr);
-    s_priv->bt_status_label = lv_label_create(d_bt);
+    s_priv->bt_switch = create_toggle_row(d, "Bluetooth", false, on_bt_switch_changed, nullptr);
+    s_priv->bt_status_label = lv_label_create(d);
     lv_label_set_text(s_priv->bt_status_label, "Bluetooth off");
     lv_obj_set_style_text_color(s_priv->bt_status_label, lv_color_hex(COLOR_TEXT_SECONDARY), 0);
-    lv_obj_t *bt_section = lv_label_create(d_bt);
+    lv_obj_t *bt_section = lv_label_create(d);
     lv_label_set_text(bt_section, "CHOOSE DEVICE");
     lv_obj_set_style_text_color(bt_section, lv_color_hex(COLOR_TEXT_SECONDARY), 0);
     lv_obj_set_style_text_font(bt_section, &lv_font_montserrat_12, 0);
-    s_priv->bt_list = lv_obj_create(d_bt);
+    s_priv->bt_list = lv_obj_create(d);
     lv_obj_set_size(s_priv->bt_list, lv_pct(100), 120);
     lv_obj_set_style_bg_opa(s_priv->bt_list, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_priv->bt_list, 0, 0);
@@ -1244,35 +1350,32 @@ static void create_detail_screens(lv_obj_t *screen)
     lv_obj_set_scroll_dir(s_priv->bt_list, LV_DIR_VER);
     lv_obj_add_flag(s_priv->bt_list, LV_OBJ_FLAG_HIDDEN);
 #elif defined(CONFIG_BT_ENABLED)
-    lv_obj_t *bt_msg = lv_label_create(d_bt);
+    lv_obj_t *bt_msg = lv_label_create(d);
     lv_label_set_text(bt_msg, "Bluetooth (BLE) enabled.\nClassic BT not supported on ESP32-S3.");
     lv_obj_set_style_text_color(bt_msg, lv_color_hex(COLOR_TEXT_SECONDARY), 0);
 #else
-    lv_obj_t *bt_msg = lv_label_create(d_bt);
+    lv_obj_t *bt_msg = lv_label_create(d);
     lv_label_set_text(bt_msg, "Bluetooth disabled in firmware");
     lv_obj_set_style_text_color(bt_msg, lv_color_hex(COLOR_TEXT_SECONDARY), 0);
 #endif
+}
 
-    /* --- Battery detail --- */
-    lv_obj_t *d_battery = lv_obj_create(detail_cont);
-    s_priv->detail_battery = d_battery;
-    lv_obj_set_size(d_battery, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_opa(d_battery, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(d_battery, 0, 0);
-    lv_obj_set_style_outline_width(d_battery, 0, 0);
-    lv_obj_set_flex_flow(d_battery, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(d_battery, 12, 0);
-    lv_obj_add_flag(d_battery, LV_OBJ_FLAG_HIDDEN);
-    create_detail_header(d_battery, "Battery", on_back_clicked);
-    s_priv->battery_charge_label = lv_label_create(d_battery);
+static void ensure_detail_battery(void)
+{
+    if (!s_priv || s_priv->detail_battery) return;
+    lv_obj_t *d = create_detail_panel(s_priv->detail_cont);
+    s_priv->detail_battery = d;
+    create_detail_header(d, "Battery", on_back_clicked);
+    s_priv->battery_charge_label = lv_label_create(d);
     lv_label_set_text(s_priv->battery_charge_label, "Charge: --%");
     lv_obj_set_style_text_color(s_priv->battery_charge_label, lv_color_hex(COLOR_TEXT_SECONDARY), 0);
     lv_obj_set_style_text_font(s_priv->battery_charge_label, &lv_font_montserrat_20, 0);
-    s_priv->battery_status_label = lv_label_create(d_battery);
+    s_priv->battery_status_label = lv_label_create(d);
     lv_label_set_text(s_priv->battery_status_label, "Status: --");
     lv_obj_set_style_text_color(s_priv->battery_status_label, lv_color_hex(COLOR_TEXT_SECONDARY), 0);
     lv_obj_set_style_text_font(s_priv->battery_status_label, &lv_font_montserrat_18, 0);
 }
+
 
 static void boot_ip_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -1405,7 +1508,7 @@ bool SettingsApp::run(void)
     lv_obj_set_style_pad_all(screen, 0, 0);
 
     create_main_list(screen);
-    create_detail_screens(screen);
+    create_detail_container(screen);
     create_password_modal(screen);
 
     return true;
@@ -1427,6 +1530,12 @@ bool SettingsApp::close(void)
     ESP_UTILS_LOGD("Close");
     battery_timer_stop();
     hide_wifi_error_popup();
+    if (s_priv && s_priv->audio_handle) {
+        esp_codec_dev_close(s_priv->audio_handle);
+        esp_codec_dev_delete(s_priv->audio_handle);
+        s_priv->audio_handle = nullptr;
+        s_priv->audio_inited = false;
+    }
     if (s_priv && s_priv->wifi_scan_done_instance) {
         esp_event_handler_instance_unregister(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, s_priv->wifi_scan_done_instance);
         s_priv->wifi_scan_done_instance = nullptr;
@@ -1439,6 +1548,7 @@ bool SettingsApp::close(void)
         esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, s_priv->ip_event_instance);
         s_priv->ip_event_instance = nullptr;
     }
+    settings_lv_detach_all();
     return true;
 }
 

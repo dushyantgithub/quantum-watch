@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>QuantumWatch</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>QuantumWatch Companion needs Bluetooth to communicate with your QuantumWatch smartwatch.</string>
+	<key>NSHealthShareUsageDescription</key>
+	<string>QuantumWatch reads your Apple Health data when the watch Health app is opened.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>QuantumWatch uses your location to show weather and time on your watch face, even in the background.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>QuantumWatch uses your location to show weather on your watch face.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Required by the speech recognition framework.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>QuantumWatch Companion uses speech recognition to transcribe voice commands from your watch.</string>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+	</dict>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>bluetooth-central</string>
+		<string>location</string>
+		<string>remote-notification</string>
+		<string>fetch</string>
+		<string>external-accessory</string>
+		<string>push-to-talk</string>
+	</array>
+	<key>UILaunchScreen</key>
+	<dict>
+		<key>UIColorName</key>
+		<string>AccentColor</string>
+	</dict>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+</dict>
+</plist>

@@ -18,6 +18,8 @@ static const char *TAG = "buttons";
 
 static button_pwr_cb_t s_pwr_cb = NULL;
 static void *s_pwr_user = NULL;
+static button_pwr_long_cb_t s_pwr_long_cb = NULL;
+static void *s_pwr_long_user = NULL;
 static button_boot_short_cb_t s_boot_short_cb = NULL;
 static void *s_boot_short_user = NULL;
 static button_boot_long_cb_t s_boot_long_cb = NULL;
@@ -31,7 +33,9 @@ static void button_task(void *arg)
     bool boot_pressed = false;
     bool pwr_pressed = false;
     uint32_t boot_press_start = 0;
+    uint32_t pwr_press_start = 0;
     bool boot_long_fired = false;
+    bool pwr_long_fired = false;
 
     while (1) {
         int boot_level = gpio_get_level(BUTTON_BOOT_GPIO);
@@ -72,17 +76,34 @@ static void button_task(void *arg)
             boot_pressed = false;
         }
 
-        /* PWR button handling (simple press) */
+        /* PWR button handling (short + long press) */
         if (pwr_now) {
             if (!pwr_pressed) {
                 pwr_pressed = true;
-                if (s_away_mode) {
-                    if (s_wake_cb) { s_wake_cb(s_wake_user); }
-                } else if (s_pwr_cb) {
-                    s_pwr_cb(s_pwr_user);
+                pwr_press_start = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                pwr_long_fired = false;
+            } else if (!s_away_mode) {
+                uint32_t elapsed = (xTaskGetTickCount() * portTICK_PERIOD_MS) - pwr_press_start;
+                if (!pwr_long_fired && elapsed >= BUTTON_LONG_PRESS_MS) {
+                    pwr_long_fired = true;
+                    if (s_pwr_long_cb) {
+                        s_pwr_long_cb(s_pwr_long_user);
+                    }
                 }
             }
         } else {
+            if (pwr_pressed) {
+                if (s_away_mode) {
+                    if (s_wake_cb) { s_wake_cb(s_wake_user); }
+                } else if (!pwr_long_fired) {
+                    uint32_t elapsed = (xTaskGetTickCount() * portTICK_PERIOD_MS) - pwr_press_start;
+                    if (elapsed >= DEBOUNCE_MS) {
+                        if (s_pwr_cb) {
+                            s_pwr_cb(s_pwr_user);
+                        }
+                    }
+                }
+            }
             pwr_pressed = false;
         }
 
@@ -134,6 +155,12 @@ void buttons_register_pwr_cb(button_pwr_cb_t cb, void *user_data)
 {
     s_pwr_cb = cb;
     s_pwr_user = user_data;
+}
+
+void buttons_register_pwr_long_cb(button_pwr_long_cb_t cb, void *user_data)
+{
+    s_pwr_long_cb = cb;
+    s_pwr_long_user = user_data;
 }
 
 void buttons_register_boot_short_cb(button_boot_short_cb_t cb, void *user_data)

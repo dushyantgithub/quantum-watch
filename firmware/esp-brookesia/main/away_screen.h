@@ -16,6 +16,7 @@ void away_screen_init(void);
 void away_screen_show(void);
 void away_screen_hide(void);
 bool away_screen_is_active(void);
+void away_screen_set_weather(int temp_c, const char *location);
 
 #ifdef __cplusplus
 }

@@ -25,6 +25,7 @@ extern "C" {
 #define BUTTON_LONG_PRESS_MS   (2000)
 
 typedef void (*button_pwr_cb_t)(void *user_data);
+typedef void (*button_pwr_long_cb_t)(void *user_data);
 typedef void (*button_boot_short_cb_t)(void *user_data);
 typedef void (*button_boot_long_cb_t)(void *user_data);
 
@@ -42,6 +43,11 @@ esp_err_t buttons_init(void);
  * @param user_data User data passed to callback
  */
 void buttons_register_pwr_cb(button_pwr_cb_t cb, void *user_data);
+
+/**
+ * @brief Register PWR long-press callback (held >= 2s).
+ */
+void buttons_register_pwr_long_cb(button_pwr_long_cb_t cb, void *user_data);
 
 /**
  * @brief Register BOOT short-press callback.

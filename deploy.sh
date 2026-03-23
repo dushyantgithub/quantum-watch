@@ -1,29 +1,53 @@
 #!/bin/bash
-# Build and flash quantum-watch firmware to the device.
-# Requires: ESP-IDF v5.4.x with export.sh already sourced.
+# Quantum Watch — firmware build and flash
+#
+# This script:
+#   1. Builds the ESP-IDF project in firmware/esp-brookesia (idf.py build)
+#   2. Flashes the watch over USB serial (idf.py flash)
+#
+# Prerequisites:
+#   - ESP-IDF v5.5.x (project targets IDF 5.5 + LVGL 9)
+#   - USB cable to the Waveshare ESP32-S3 Touch AMOLED board
 #
 # Usage:
-#   . $IDF_PATH/export.sh   # in same shell, or add to your profile
-#   ./deploy.sh
-#   ./deploy.sh /dev/cu.usbmodem1101   # specify port
+#   ./deploy.sh                      # uses ESPPORT, or default port below
+#   ./deploy.sh /dev/cu.usbmodem101  # explicit port (recommended on macOS)
+#   ESPPORT=/dev/cu.usbmodem101 ./deploy.sh
+#
+# After flash, serial monitor:
+#   cd firmware/esp-brookesia && idf.py -p /dev/cu.usbmodem101 monitor
 
-set -e
-cd "$(dirname "$0")/firmware/esp-brookesia"
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT/firmware/esp-brookesia"
 
-PORT="${1:-/dev/cu.usbmodem1101}"
+# Pick ESP-IDF if idf.py is not already on PATH
+if ! command -v idf.py &>/dev/null; then
+    for IDF in "${IDF_PATH:-}" "$HOME/esp/esp-idf" "$HOME/esp/esp-idf-v5.5"; do
+        if [[ -n "$IDF" && -f "$IDF/export.sh" ]]; then
+            # shellcheck source=/dev/null
+            source "$IDF/export.sh"
+            break
+        fi
+    done
+fi
 
 if ! command -v idf.py &>/dev/null; then
-    echo "Error: idf.py not found. Source ESP-IDF first:"
-    echo "  . \$IDF_PATH/export.sh"
-    echo ""
-    echo "This project requires ESP-IDF v5.4.x"
+    echo "Error: idf.py not found. Install ESP-IDF and either:"
+    echo "  . \\\$IDF_PATH/export.sh"
+    echo "  or set IDF_PATH to your esp-idf checkout (e.g. ~/esp/esp-idf)."
     exit 1
 fi
 
-echo "Building..."
+# Port: CLI arg > ESPPORT env > sensible macOS default (override if yours differs)
+PORT="${1:-${ESPPORT:-/dev/cu.usbmodem101}}"
+
+echo "=== Build (firmware/esp-brookesia) ==="
 idf.py build
 
-echo "Flashing to $PORT..."
+echo ""
+echo "=== Flash to $PORT ==="
 idf.py -p "$PORT" flash
 
-echo "Done. You can run 'idf.py -p $PORT monitor' to view logs."
+echo ""
+echo "Done. Logs: cd firmware/esp-brookesia && idf.py -p $PORT monitor"

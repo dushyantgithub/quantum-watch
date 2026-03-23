@@ -5,6 +5,9 @@ firmware/esp-brookesia/sdkconfig.old
 
 # IDE
 .cursor/
+firmware/esp-brookesia/.cache/
+ios/QuantumWatchCompanion.xcodeproj/project.xcworkspace/xcuserdata/
+ios/QuantumWatchCompanion.xcodeproj/xcuserdata/
 
 # OS
 .DS_Store

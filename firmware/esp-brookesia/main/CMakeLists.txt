@@ -1,7 +1,8 @@
 idf_component_register(
-    SRCS "main.cpp" "buttons.c" "away_screen.cpp" "bg_image.c"
+    SRCS "main.cpp" "buttons.c" "away_screen.cpp" "voice_assistant.cpp" "notifications.cpp" "ancs_client.cpp" "health_app.cpp" "voice_assistant_icon.c" "health_app_icon.c"
     INCLUDE_DIRS "."
-    REQUIRES brookesia_app_squareline_demo brookesia_app_settings)
+    REQUIRES bt brookesia_core espressif__esp-lib-utils
+    WHOLE_ARCHIVE)
 
 target_compile_options(${COMPONENT_LIB} PUBLIC -Wno-missing-field-initializers)
 
