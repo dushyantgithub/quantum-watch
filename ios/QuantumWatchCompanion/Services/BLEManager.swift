@@ -21,6 +21,7 @@ class BLEManager: NSObject, ObservableObject {
     static let healthDataCharUUID = CBUUID(string: "0000AA06-0000-1000-8000-00805F9B34FB")
 
     private static let savedPeripheralKey = "com.quantumwatch.savedPeripheralUUID"
+    private static let watchName = "QuantumWatch"
 
     @Published var connectionState: BLEConnectionState = .disconnected
     @Published var bluetoothReady: Bool = false
@@ -40,6 +41,9 @@ class BLEManager: NSObject, ObservableObject {
     private var healthRequestCharacteristic: CBCharacteristic?
     private var healthDataCharacteristic: CBCharacteristic?
     private var autoReconnect = true
+    private var connectAttemptStartedAt: Date?
+    private var supersededPeripheralIDs = Set<UUID>()
+    private var broadScanFallbackWorkItem: DispatchWorkItem?
     /// Set by willRestoreState so centralManagerDidUpdateState can skip redundant work
     private var restoredFromBackground = false
     /// Pending notification payload to send when BLE reconnects
@@ -73,6 +77,7 @@ class BLEManager: NSObject, ObservableObject {
     func startScanning() {
         guard centralManager.state == .poweredOn else { return }
         autoReconnect = true
+        broadScanFallbackWorkItem?.cancel()
 
         // If we already have a connected peripheral (e.g. restored from background), just ensure services
         if let existing = peripheral, existing.state == .connected {
@@ -97,12 +102,11 @@ class BLEManager: NSObject, ObservableObject {
             peripheral = known
             known.delegate = self
             connectionState = .scanning
+            connectAttemptStartedAt = Date()
             centralManager.connect(known, options: connectOptions)
             // Also scan in parallel in case the saved peripheral is gone
-            centralManager.scanForPeripherals(
-                withServices: [BLEManager.serviceUUID],
-                options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
-            )
+            startServiceScan()
+            scheduleBroadScanFallback()
             return
         }
 
@@ -113,6 +117,7 @@ class BLEManager: NSObject, ObservableObject {
             peripheral = first
             first.delegate = self
             connectionState = .scanning
+            connectAttemptStartedAt = Date()
             centralManager.connect(first, options: connectOptions)
             return
         }
@@ -120,13 +125,13 @@ class BLEManager: NSObject, ObservableObject {
         // Fall back to scanning
         bleLog.info("No known peripheral — scanning for service")
         connectionState = .scanning
-        centralManager.scanForPeripherals(
-            withServices: [BLEManager.serviceUUID],
-            options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
-        )
+        connectAttemptStartedAt = nil
+        startServiceScan()
+        scheduleBroadScanFallback()
     }
 
     func stopScanning() {
+        broadScanFallbackWorkItem?.cancel()
         centralManager.stopScan()
         if connectionState == .scanning {
             connectionState = .disconnected
@@ -135,6 +140,7 @@ class BLEManager: NSObject, ObservableObject {
 
     func disconnect() {
         autoReconnect = false
+        broadScanFallbackWorkItem?.cancel()
         if let peripheral = peripheral {
             centralManager.cancelPeripheralConnection(peripheral)
         }
@@ -258,6 +264,40 @@ class BLEManager: NSObject, ObservableObject {
         writeHealthData(payload)
     }
 
+    private func startServiceScan() {
+        bleLog.info("Starting service-filtered BLE scan")
+        centralManager.scanForPeripherals(
+            withServices: [BLEManager.serviceUUID],
+            options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+        )
+    }
+
+    private func scheduleBroadScanFallback() {
+        broadScanFallbackWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self, self.connectionState == .scanning else { return }
+            bleLog.warning("Service-filtered scan found nothing; falling back to broad scan")
+            self.centralManager.stopScan()
+            self.centralManager.scanForPeripherals(
+                withServices: nil,
+                options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+            )
+        }
+        broadScanFallbackWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0, execute: workItem)
+    }
+
+    private func looksLikeQuantumWatch(_ peripheral: CBPeripheral, advertisementData: [String: Any]) -> Bool {
+        if let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String,
+           advertisedName == BLEManager.watchName {
+            return true
+        }
+        if peripheral.name == BLEManager.watchName {
+            return true
+        }
+        return false
+    }
+
     // MARK: - Peripheral Persistence
 
     private var savedPeripheralUUID: UUID? {
@@ -321,24 +361,50 @@ extension BLEManager: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                          advertisementData: [String: Any], rssi RSSI: NSNumber) {
-        bleLog.info("Discovered peripheral \(peripheral.identifier.uuidString.prefix(8)) RSSI=\(RSSI)")
+        let advertisedName = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? "nil"
+        let serviceUUIDs = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
+        let matchesService = serviceUUIDs.contains(BLEManager.serviceUUID)
+        let matchesName = looksLikeQuantumWatch(peripheral, advertisementData: advertisementData)
+
+        bleLog.info(
+            "Discovered peripheral \(peripheral.identifier.uuidString.prefix(8)) RSSI=\(RSSI) name=\(advertisedName, privacy: .public) matchesService=\(matchesService) matchesName=\(matchesName)"
+        )
+
+        guard matchesService || matchesName else {
+            return
+        }
+
+        broadScanFallbackWorkItem?.cancel()
 
         // If we're already connecting to a saved peripheral, ignore scan results
         if let existing = self.peripheral, existing.state == .connecting {
             if existing.identifier == peripheral.identifier { return }
+
+            let connectAge = Date().timeIntervalSince(connectAttemptStartedAt ?? .distantPast)
+            bleLog.warning(
+                "Discovered alternate peripheral \(peripheral.identifier.uuidString.prefix(8)) while connecting to \(existing.identifier.uuidString.prefix(8)), age=\(connectAge, privacy: .public)s"
+            )
+
+            // A stale restored/saved CBPeripheral can stay in connecting state and block the real watch.
+            // If we discover a valid matching service while that happens, switch to the live device.
+            supersededPeripheralIDs.insert(existing.identifier)
+            central.cancelPeripheralConnection(existing)
         }
 
         self.peripheral = peripheral
         peripheral.delegate = self
         central.stopScan()
+        connectAttemptStartedAt = Date()
         central.connect(peripheral, options: connectOptions)
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         bleLog.info("Connected to \(peripheral.identifier.uuidString.prefix(8))")
+        broadScanFallbackWorkItem?.cancel()
         central.stopScan()
         connectionState = .connected
         autoReconnect = true
+        connectAttemptStartedAt = nil
         savedPeripheralUUID = peripheral.identifier
         peripheral.discoverServices([BLEManager.serviceUUID])
     }
@@ -347,6 +413,12 @@ extension BLEManager: CBCentralManagerDelegate {
                          timestamp: CFAbsoluteTime, isReconnecting: Bool, error: Error?) {
         bleLog.warning("Disconnected from \(peripheral.identifier.uuidString.prefix(8)), isReconnecting=\(isReconnecting), error: \(error?.localizedDescription ?? "none")")
         clearCharacteristics()
+        connectAttemptStartedAt = nil
+
+        if supersededPeripheralIDs.remove(peripheral.identifier) != nil {
+            bleLog.info("Ignoring disconnect from superseded peripheral \(peripheral.identifier.uuidString.prefix(8))")
+            return
+        }
 
         if isReconnecting {
             // System is handling reconnection via CBConnectPeripheralOptionEnableAutoReconnect.
@@ -359,16 +431,15 @@ extension BLEManager: CBCentralManagerDelegate {
             // Manually queue reconnection — CoreBluetooth maintains this request
             // even when the app is suspended
             bleLog.info("Queuing background reconnect")
+            connectAttemptStartedAt = Date()
             central.connect(peripheral, options: connectOptions)
             connectionState = .scanning
 
             // Also scan as fallback (only effective while app is active)
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
                 guard let self = self, self.connectionState != .connected else { return }
-                self.centralManager.scanForPeripherals(
-                    withServices: [BLEManager.serviceUUID],
-                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
-                )
+                self.startServiceScan()
+                self.scheduleBroadScanFallback()
             }
         }
     }
@@ -382,6 +453,7 @@ extension BLEManager: CBCentralManagerDelegate {
         // Retry connection
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             guard let self = self else { return }
+            self.connectAttemptStartedAt = Date()
             self.centralManager.connect(peripheral, options: self.connectOptions)
             self.connectionState = .scanning
         }
