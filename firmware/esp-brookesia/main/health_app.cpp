@@ -26,6 +26,7 @@
 #include "health_app.h"
 #include "voice_assistant.h"
 #include "watch_theme.h"
+#include "vokrr_state.h"
 
 LV_IMG_DECLARE(quantum_watch_health_app_icon_98_98);
 
@@ -451,6 +452,8 @@ void health_app_on_ble_data_chunk(const uint8_t *data, uint16_t len, bool final)
     s_priv->rx_buffer.clear();
     s_priv->refresh_in_flight = false;
     health_unlock();
+
+    vokrr::state_apply_legacy_health(s_priv->latest_payload.c_str());
 
     ESP_UTILS_LOGI("Health reply complete");
     if (!health_lv_attached()) {

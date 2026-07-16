@@ -2,6 +2,7 @@
 firmware/esp-brookesia/build/
 firmware/esp-brookesia/managed_components/
 firmware/esp-brookesia/sdkconfig.old
+firmware/esp-brookesia/main/vokrr_secrets.local.h
 
 # IDE
 .cursor/

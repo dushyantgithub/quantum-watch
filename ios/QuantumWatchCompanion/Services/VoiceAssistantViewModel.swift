@@ -151,7 +151,8 @@ class VoiceAssistantViewModel: ObservableObject {
 
             // Send response back to watch
             currentStatus = "Sending to watch..."
-            bleManager.writeResponse(responseText)
+            // Send both sides of the exchange so the watch can render its chat transcript.
+            bleManager.writeResponse("CHAT|\(transcription)\n\(responseText)")
             addLog("Sent to watch", icon: "checkmark.circle.fill", color: .green)
 
         } catch {

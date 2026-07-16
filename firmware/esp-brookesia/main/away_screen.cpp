@@ -110,7 +110,7 @@ static void update_time_display(void)
     /* Weather line */
     if (s_has_weather) {
         char wbuf[96];
-        lv_snprintf(wbuf, sizeof(wbuf), "%d\xC2\xB0""C  %s", s_temp_c, s_location);
+        lv_snprintf(wbuf, sizeof(wbuf), "%d C  %s", s_temp_c, s_location);
         lv_label_set_text(s_weather_label, wbuf);
     }
 

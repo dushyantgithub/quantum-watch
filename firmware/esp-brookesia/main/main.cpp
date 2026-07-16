@@ -6,26 +6,30 @@
 
 #include "bsp/esp-bsp.h"
 #include "esp_brookesia.hpp"
-#include "boost/thread.hpp"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #ifdef ESP_UTILS_LOG_TAG
 #   undef ESP_UTILS_LOG_TAG
 #endif
 #define ESP_UTILS_LOG_TAG "Main"
 #include "esp_lib_utils.h"
-#include "./dark/stylesheet.hpp"
 #include "buttons.h"
-#include "away_screen.h"
 #include "esp_system.h"
 #include "voice_assistant.h"
 #include "notifications.h"
+#include "startup_logo.h"
+#include "vokrr_network.h"
+#include "vokrr_os.h"
+#include "vokrr_state.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
+#include "driver/i2c_master.h"
 #include "display/lv_display_private.h"
 
 using namespace esp_brookesia;
 using namespace esp_brookesia::gui;
-using namespace esp_brookesia::systems::phone;
 
 #define LVGL_PORT_INIT_CONFIG() \
     {                               \
@@ -36,9 +40,107 @@ using namespace esp_brookesia::systems::phone;
         .timer_period_ms = 5,     \
     }
 
-#define AWAY_TIMEOUT_MS 120000
+/* AXP2101 PMIC on the Waveshare AMOLED board */
+#define AXP2101_I2C_ADDR         0x34U
+#define AXP2101_REG_STATUS       0x00U
+#define AXP2101_REG_VBAT_H       0x34U
+#define AXP2101_CHG_STAT_MASK    0xC0U
+#define AXP2101_VBAT_MV_PER_LSB  1U
 
-constexpr bool EXAMPLE_SHOW_MEM_INFO = false;
+struct StatusBarBatteryInfo {
+    int percent = -1;
+    bool charging = false;
+    bool available = false;
+};
+
+static volatile int s_status_bar_battery_percent = -1;
+static volatile bool s_status_bar_battery_charging = false;
+static volatile bool s_status_bar_battery_available = false;
+static volatile bool s_status_bar_battery_ready = false;
+static TaskHandle_t s_status_bar_battery_task = nullptr;
+
+static bool status_bar_battery_read_axp2101(StatusBarBatteryInfo *out)
+{
+    if (!out) {
+        return false;
+    }
+
+    *out = {};
+
+    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+    if (!bus) {
+        return false;
+    }
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = AXP2101_I2C_ADDR,
+        .scl_speed_hz = 100000,
+    };
+
+    i2c_master_dev_handle_t dev = nullptr;
+    esp_err_t err = i2c_master_bus_add_device(bus, &dev_cfg, &dev);
+    if (err != ESP_OK || !dev) {
+        return false;
+    }
+
+    uint8_t reg_addr = AXP2101_REG_STATUS;
+    uint8_t status = 0;
+    err = i2c_master_transmit_receive(dev, &reg_addr, 1, &status, 1, 100);
+    if (err != ESP_OK) {
+        i2c_master_bus_rm_device(dev);
+        return false;
+    }
+
+    /* Treat charging and charge-complete as externally powered so the charging icon is shown whenever USB-C is plugged in. */
+    out->charging = (status & AXP2101_CHG_STAT_MASK) != 0;
+
+    reg_addr = AXP2101_REG_VBAT_H;
+    uint8_t vbat_buf[2] = {0};
+    err = i2c_master_transmit_receive(dev, &reg_addr, 1, vbat_buf, 2, 100);
+    i2c_master_bus_rm_device(dev);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    int raw = ((vbat_buf[0] & 0x0F) << 8) | vbat_buf[1];
+    int voltage_mv = raw * AXP2101_VBAT_MV_PER_LSB;
+    if (voltage_mv <= 3000) {
+        out->percent = 0;
+    } else if (voltage_mv >= 4200) {
+        out->percent = 100;
+    } else {
+        out->percent = ((voltage_mv - 3000) * 100) / 1200;
+    }
+
+    out->available = true;
+    return true;
+}
+
+static void status_bar_battery_read_task(void *arg)
+{
+    (void)arg;
+
+    StatusBarBatteryInfo info = {};
+    status_bar_battery_read_axp2101(&info);
+
+    s_status_bar_battery_percent = info.percent;
+    s_status_bar_battery_charging = info.charging;
+    s_status_bar_battery_available = info.available;
+    s_status_bar_battery_ready = true;
+    s_status_bar_battery_task = nullptr;
+
+    vTaskDelete(nullptr);
+}
+
+static void status_bar_battery_request_refresh()
+{
+    if (!s_status_bar_battery_task) {
+        xTaskCreatePinnedToCore(
+            status_bar_battery_read_task, "status_bat", 3072, nullptr, 2, &s_status_bar_battery_task, 0
+        );
+    }
+}
 
 /* ── Flush-wait callback ──
  * LVGL 9's default wait_for_flushing() does `while(disp->flushing);` — a bare
@@ -62,9 +164,64 @@ static void display_flush_wait_cb(lv_display_t *disp)
     }
 }
 
+static void startup_splash_set_opa(void *var, int32_t value)
+{
+    auto *obj = static_cast<lv_obj_t *>(var);
+    if (obj && lv_obj_is_valid(obj)) {
+        lv_obj_set_style_opa(obj, static_cast<lv_opa_t>(value), 0);
+    }
+}
+
+static void startup_splash_delete(lv_anim_t *anim)
+{
+    auto *overlay = static_cast<lv_obj_t *>(anim->user_data);
+    if (overlay && lv_obj_is_valid(overlay)) {
+        lv_obj_delete(overlay);
+    }
+}
+
+static void startup_splash_show()
+{
+    lv_obj_t *overlay = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(overlay);
+    lv_obj_set_size(overlay, BSP_LCD_H_RES, BSP_LCD_V_RES);
+    lv_obj_set_style_bg_color(overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_center(overlay);
+
+    lv_obj_t *logo = lv_image_create(overlay);
+    lv_image_set_src(logo, &quantum_watch_startup_logo_220_220);
+    lv_obj_set_style_opa(logo, LV_OPA_TRANSP, 0);
+    lv_obj_center(logo);
+
+    lv_anim_t fade_in;
+    lv_anim_init(&fade_in);
+    lv_anim_set_var(&fade_in, logo);
+    lv_anim_set_exec_cb(&fade_in, startup_splash_set_opa);
+    lv_anim_set_values(&fade_in, LV_OPA_TRANSP, LV_OPA_COVER);
+    lv_anim_set_time(&fade_in, 320);
+    lv_anim_set_delay(&fade_in, 80);
+    lv_anim_set_path_cb(&fade_in, lv_anim_path_ease_out);
+    lv_anim_start(&fade_in);
+
+    lv_anim_t fade_out;
+    lv_anim_init(&fade_out);
+    lv_anim_set_var(&fade_out, logo);
+    lv_anim_set_user_data(&fade_out, overlay);
+    lv_anim_set_exec_cb(&fade_out, startup_splash_set_opa);
+    lv_anim_set_values(&fade_out, LV_OPA_COVER, LV_OPA_TRANSP);
+    lv_anim_set_time(&fade_out, 280);
+    lv_anim_set_delay(&fade_out, 900);
+    lv_anim_set_path_cb(&fade_out, lv_anim_path_ease_in);
+    lv_anim_set_completed_cb(&fade_out, startup_splash_delete);
+    lv_anim_start(&fade_out);
+}
+
 extern "C" void app_main(void)
 {
-    ESP_UTILS_LOGI("Display ESP-Brookesia phone demo");
+    ESP_UTILS_LOGI("Vokrr Watch OS starting");
 
     /* BLE bonding/config persistence depends on NVS. Settings used to initialize this as a side effect,
      * so keep it explicit here now that Settings is removed from the build. */
@@ -74,6 +231,7 @@ extern "C" void app_main(void)
         nvs_err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(nvs_err);
+    vokrr::state_init();
 
     bsp_display_cfg_t cfg = {
         .lvgl_port_cfg = LVGL_PORT_INIT_CONFIG(),
@@ -101,106 +259,73 @@ extern "C" void app_main(void)
         return true;
     });
 
-    /* Create a phone object */
-    Phone *phone = new (std::nothrow) Phone();
-    ESP_UTILS_CHECK_NULL_EXIT(phone, "Create phone failed");
-
-    /* Try using a stylesheet that corresponds to the resolution */
-    if ((BSP_LCD_H_RES == 410) && (BSP_LCD_V_RES == 502)) {
-        Stylesheet *stylesheet = new (std::nothrow) Stylesheet(STYLESHEET_410_502_DARK);
-        ESP_UTILS_CHECK_NULL_EXIT(stylesheet, "Create stylesheet failed");
-
-        ESP_UTILS_LOGI("Using stylesheet (%s)", stylesheet->core.name);
-        ESP_UTILS_CHECK_FALSE_EXIT(phone->addStylesheet(stylesheet), "Add stylesheet failed");
-        ESP_UTILS_CHECK_FALSE_EXIT(phone->activateStylesheet(stylesheet), "Activate stylesheet failed");
-        delete stylesheet;
-    }
-
     {
-        // When operating on non-GUI tasks, should acquire a lock before operating on LVGL
+        // When operating on non-GUI tasks, acquire the LVGL lock first.
         LvLockGuard gui_guard;
 
-        /* Begin the phone */
-        ESP_UTILS_CHECK_FALSE_EXIT(phone->begin(), "Begin failed");
-        // assert(phone->getDisplay().showContainerBorder() && "Show container border failed");
+        /* Keep boot visuals lightweight: one centered image over black with opacity-only animation. */
+        vokrr::os_init();
+        startup_splash_show();
 
-        /* Init and install apps from registry */
-        std::vector<systems::base::Manager::RegistryAppInfo> inited_apps;
-        ESP_UTILS_CHECK_FALSE_EXIT(phone->initAppFromRegistry(inited_apps), "Init app registry failed");
-        ESP_UTILS_CHECK_FALSE_EXIT(phone->installAppFromRegistry(inited_apps), "Install app registry failed");
+        /* Publish asynchronous PMIC results into the Vokrr state model. */
+        lv_timer_create([](lv_timer_t *) {
+            if (s_status_bar_battery_ready) {
+                s_status_bar_battery_ready = false;
+                if (s_status_bar_battery_available) {
+                    vokrr::state_set_battery(
+                        s_status_bar_battery_percent, s_status_bar_battery_charging
+                    );
+                }
+            }
+        }, 1000, nullptr);
 
-        /* Create a timer to update the clock */
+        /* Keep PMIC reads off the LVGL task to avoid UI stalls. */
         lv_timer_create([](lv_timer_t *t) {
-            time_t now;
-            struct tm timeinfo;
-            Phone *phone = (Phone *)t->user_data;
-
-            ESP_UTILS_CHECK_NULL_EXIT(phone, "Invalid phone");
-
-            time(&now);
-            localtime_r(&now, &timeinfo);
-
-            ESP_UTILS_CHECK_FALSE_EXIT(
-                phone->getDisplay().getStatusBar()->setClock(timeinfo.tm_hour, timeinfo.tm_min),
-                "Refresh status bar failed"
-            );
-        }, 1000, phone);
-
-        /* Initialize the away screen overlay */
-        away_screen_init();
+            (void)t;
+            status_bar_battery_request_refresh();
+        }, 15000, nullptr);
+        status_bar_battery_request_refresh();
 
         /* Initialize notification system (call overlay + drawer) */
         notifications_init();
-
-        /* Inactivity timer: show away screen after AWAY_TIMEOUT_MS of no interaction */
-        lv_timer_create([](lv_timer_t *t) {
-            (void)t;
-            if (!away_screen_is_active()) {
-                uint32_t inactive = lv_display_get_inactive_time(NULL);
-                if (inactive > AWAY_TIMEOUT_MS) {
-                    away_screen_show();
-                    buttons_set_away_mode(true);
-                }
-            }
-        }, 2000, NULL);
     }
 
-    /* Start BLE advertising at boot so iPhone can discover the watch immediately */
+    ESP_LOGI("Vokrr", "UI ready (internal heap %u bytes, largest %u; PSRAM %u bytes)",
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+
+    /* Initialize the larger WiFi pools before BLE to avoid fragmenting scarce internal SRAM. */
+    vokrr::network_start();
+    /* Start BLE advertising at boot so iPhone can discover the watch immediately. */
     esp_brookesia::apps::va_init_ble();
+    ESP_LOGI("Vokrr", "Runtime ready (internal heap %u bytes, largest %u; PSRAM %u bytes)",
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
 
     /* Initialize physical buttons: BOOT and PWR */
     ESP_UTILS_CHECK_ERROR_EXIT(buttons_init(), "Buttons init failed");
 
-    /* PWR: short press -> navigate to home screen */
+    /* PWR: short press -> dashboard */
     buttons_register_pwr_cb([](void *user_data) {
-        Phone *p = (Phone *)user_data;
-        if (p) {
-            LvLockGuard gui_guard;
-            p->sendNavigateEvent(systems::base::Manager::NavigateType::HOME);
-        }
-    }, phone);
+        (void)user_data;
+        LvLockGuard gui_guard;
+        vokrr::os_show_page(0);
+    }, nullptr);
 
-    /* PWR: long press -> open Voice Assistant */
+    /* PWR: long press -> Jarvis page */
     buttons_register_pwr_long_cb([](void *user_data) {
-        Phone *p = (Phone *)user_data;
-        auto *va = esp_brookesia::apps::VoiceAssistantApp::requestInstance();
-        if (p && va) {
-            LvLockGuard gui_guard;
-            systems::base::Context::AppEventData evt = {
-                .id = va->getId(),
-                .type = systems::base::Context::AppEventType::START,
-            };
-            p->sendAppEvent(&evt);
-        }
-    }, phone);
+        (void)user_data;
+        LvLockGuard gui_guard;
+        vokrr::os_show_page(3);
+    }, nullptr);
 
     /* BOOT: short press -> show away screen */
     buttons_register_boot_short_cb([](void *user_data) {
         (void)user_data;
-        if (!away_screen_is_active()) {
-            away_screen_show();
-            buttons_set_away_mode(true);
-        }
+        LvLockGuard gui_guard;
+        vokrr::os_show_page(5);
     }, NULL);
 
     /* BOOT: long press -> restart the watch */
@@ -214,46 +339,7 @@ extern "C" void app_main(void)
     buttons_register_wake_cb([](void *user_data) {
         (void)user_data;
         LvLockGuard gui_guard;
-        away_screen_hide();
-        buttons_set_away_mode(false);
+        vokrr::os_show_page(0);
     }, NULL);
 
-    if constexpr (EXAMPLE_SHOW_MEM_INFO) {
-        esp_utils::thread_config_guard thread_config({
-            .name = "mem_info",
-            .stack_size = 4096,
-        });
-        boost::thread([ = ]() {
-            char buffer[128];    /* Make sure buffer is enough for `sprintf` */
-            size_t internal_free = 0;
-            size_t internal_total = 0;
-            size_t external_free = 0;
-            size_t external_total = 0;
-
-            while (1) {
-                internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-                internal_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
-                external_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-                external_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-                sprintf(buffer,
-                        "\t           Biggest /     Free /    Total\n"
-                        "\t  SRAM : [%8d / %8d / %8d]\n"
-                        "\t PSRAM : [%8d / %8d / %8d]",
-                        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL), internal_free, internal_total,
-                        heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM), external_free, external_total);
-                ESP_UTILS_LOGI("\n%s", buffer);
-
-                {
-                    LvLockGuard gui_guard;
-                    ESP_UTILS_CHECK_FALSE_EXIT(
-                        phone->getDisplay().getRecentsScreen()->setMemoryLabel(
-                            internal_free / 1024, internal_total / 1024, external_free / 1024, external_total / 1024
-                        ), "Set memory label failed"
-                    );
-                }
-
-                boost::this_thread::sleep_for(boost::chrono::seconds(5));
-            }
-        }).detach();
-    }
 }

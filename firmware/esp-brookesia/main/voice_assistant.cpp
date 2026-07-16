@@ -45,6 +45,8 @@
 #include "notifications.h"
 #include "health_app.h"
 #include "watch_theme.h"
+#include "vokrr_os.h"
+#include "vokrr_state.h"
 
 /* ── App name ── */
 #define APP_NAME "Voice Assistant"
@@ -303,13 +305,10 @@ static uint8_t adpcm_encode_sample(int16_t sample, AdpcmState *state)
     step >>= 1;
     if (diff >= step) { nibble |= 1; diffq += step; }
 
-    if (nibble & 8) {
-        state->predicted -= diffq;
-    } else {
-        state->predicted += diffq;
-    }
-    if (state->predicted > 32767) state->predicted = 32767;
-    if (state->predicted < -32768) state->predicted = -32768;
+    int predicted = state->predicted + ((nibble & 8) ? -diffq : diffq);
+    if (predicted > 32767) predicted = 32767;
+    if (predicted < -32768) predicted = -32768;
+    state->predicted = static_cast<int16_t>(predicted);
 
     state->index += ima_index_table[nibble];
     if (state->index < 0) state->index = 0;
@@ -454,6 +453,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 }
 
 /* Forward declaration */
+static bool start_recording(void);
 static void stop_recording(void);
 
 static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
@@ -547,6 +547,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
     case ESP_GATTS_CONNECT_EVT: {
         g_ble.conn_id = param->connect.conn_id;
         g_ble.connected = true;
+        vokrr::state_set_ble(true, "iPhone");
         /* Request MTU 512 */
         esp_ble_gatt_set_local_mtu(512);
         {
@@ -561,6 +562,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
     }
     case ESP_GATTS_DISCONNECT_EVT: {
         g_ble.connected = false;
+        vokrr::state_set_ble(false);
         g_ble.audio_notify_enabled = false;
         g_ble.health_request_notify_enabled = false;
         keepalive_stop();
@@ -608,6 +610,18 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
                     } else {
                         /* Final chunk — display (only if VA UI is on-screen) */
                         LvLockGuard gui_guard;
+                        if (s_priv->response_text.rfind("CHAT|", 0) == 0) {
+                            const size_t split = s_priv->response_text.find('\n', 5);
+                            if (split != std::string::npos) {
+                                const std::string user = s_priv->response_text.substr(5, split - 5);
+                                const std::string assistant = s_priv->response_text.substr(split + 1);
+                                vokrr::os_on_chat_exchange(user.c_str(), assistant.c_str());
+                            } else {
+                                vokrr::os_on_assistant_text(s_priv->response_text.c_str() + 5);
+                            }
+                        } else {
+                            vokrr::os_on_assistant_text(s_priv->response_text.c_str());
+                        }
                         if (va_lv_attached()) {
                             set_state(VA_STATE_RESPONSE);
                         }
@@ -638,6 +652,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
 
                 /* Update away screen weather */
                 away_screen_set_weather(temp, location.c_str());
+                vokrr::os_set_context(ts, temp, location.c_str());
             }
 
             if (param->write.need_rsp) {
@@ -793,6 +808,29 @@ bool va_request_health_refresh(void)
         return false;
     }
     return true;
+}
+
+bool va_start_listening(void)
+{
+    if (!g_ble.connected || !s_priv) return false;
+    if (s_priv->recording) return true;
+    if (!start_recording()) return false;
+    s_priv->state = VA_STATE_LISTENING;
+    vokrr::os_set_listening(true, false);
+    return true;
+}
+
+void va_stop_listening(void)
+{
+    if (!s_priv || !s_priv->recording) return;
+    stop_recording();
+    s_priv->state = VA_STATE_PROCESSING;
+    vokrr::os_set_listening(false, true);
+}
+
+bool va_is_listening(void)
+{
+    return s_priv && s_priv->recording;
 }
 
 /* ── Audio capture ── */

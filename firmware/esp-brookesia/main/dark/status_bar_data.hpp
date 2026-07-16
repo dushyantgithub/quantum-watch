@@ -7,6 +7,7 @@
 
 #include "systems/phone/widgets/status_bar/esp_brookesia_status_bar.hpp"
 #include "systems/phone/assets/esp_brookesia_phone_assets.h"
+#include "systems/speaker/assets/esp_brookesia_speaker_assets.h"
 
 namespace esp_brookesia::systems::phone {
 
@@ -15,7 +16,7 @@ constexpr StatusBar::AreaData STYLESHEET_410_502_DARK_STATUS_BAR_AREA_DATA(int w
     return {
         .size = gui::StyleSize::RECT_PERCENT(w_percent, 100),
         .layout_column_align = align,
-        .layout_column_start_offset = 60,
+        .layout_column_start_offset = 32,
         .layout_column_pad = 3,
     };
 }
@@ -32,9 +33,9 @@ constexpr StatusBar::Data STYLESHEET_410_502_DARK_STATUS_BAR_DATA = {
     .area = {
         .num = 3,
         .data = {
-            STYLESHEET_410_502_DARK_STATUS_BAR_AREA_DATA(30, StatusBar::AreaAlign::START),
-            STYLESHEET_410_502_DARK_STATUS_BAR_AREA_DATA(40, StatusBar::AreaAlign::CENTER),
-            STYLESHEET_410_502_DARK_STATUS_BAR_AREA_DATA(30, StatusBar::AreaAlign::END),
+            STYLESHEET_410_502_DARK_STATUS_BAR_AREA_DATA(22, StatusBar::AreaAlign::START),
+            STYLESHEET_410_502_DARK_STATUS_BAR_AREA_DATA(38, StatusBar::AreaAlign::CENTER),
+            STYLESHEET_410_502_DARK_STATUS_BAR_AREA_DATA(40, StatusBar::AreaAlign::END),
         },
     },
     .icon_common_size = gui::StyleSize::SQUARE_PERCENT(60),
@@ -57,12 +58,16 @@ constexpr StatusBar::Data STYLESHEET_410_502_DARK_STATUS_BAR_DATA = {
         .area_index = 2,
         .icon_data = {
             .icon = {
-                .image_num = 4,
+                .image_num = 2,
                 .images = {
-                    gui::StyleImage::IMAGE_RECOLOR_WHITE(&esp_brookesia_image_large_status_bar_wifi_close_36_36),
-                    gui::StyleImage::IMAGE_RECOLOR_WHITE(&esp_brookesia_image_large_status_bar_wifi_level1_36_36),
-                    gui::StyleImage::IMAGE_RECOLOR_WHITE(&esp_brookesia_image_large_status_bar_wifi_level2_36_36),
-                    gui::StyleImage::IMAGE_RECOLOR_WHITE(&esp_brookesia_image_large_status_bar_wifi_level3_36_36),
+                    gui::StyleImage::IMAGE_RECOLOR(
+                        &speaker_image_middle_quick_settings_bluetooth_48_48,
+                        0x8B8B98
+                    ),
+                    gui::StyleImage::IMAGE_RECOLOR(
+                        &speaker_image_middle_quick_settings_bluetooth_48_48,
+                        0x3137CE
+                    ),
                 },
             },
         },
@@ -75,7 +80,7 @@ constexpr StatusBar::Data STYLESHEET_410_502_DARK_STATUS_BAR_DATA = {
         .enable_main_size_max = 1,
         .enable_battery_icon = 1,
         .enable_battery_icon_common_size = 1,
-        .enable_battery_label = 0,
+        .enable_battery_label = 1,
         .enable_wifi_icon = 1,
         .enable_wifi_icon_common_size = 1,
         .enable_clock = 1,

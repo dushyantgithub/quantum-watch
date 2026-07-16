@@ -34,4 +34,7 @@ namespace esp_brookesia::apps {
     bool va_init_ble(void);
     bool va_ble_is_connected(void);
     bool va_request_health_refresh(void);
+    bool va_start_listening(void);
+    void va_stop_listening(void);
+    bool va_is_listening(void);
 }

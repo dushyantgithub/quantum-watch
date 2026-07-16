@@ -383,16 +383,16 @@ bool StatusBar::beginBattery(void)
     ESP_UTILS_LOGD("Begin battery(0x%p)", this);
     ESP_UTILS_CHECK_FALSE_RETURN(!checkBatteryInitialized(), false, "Already initialized");
 
+    if (_data.flags.enable_battery_icon) {
+        ESP_UTILS_CHECK_FALSE_RETURN(addIcon(_data.battery.icon_data, _data.battery.area_index, _battery_id), false,
+                                     "Add battery icon failed");
+    }
     if (_data.flags.enable_battery_label) {
         battery_label = ESP_BROOKESIA_LV_OBJ(label, _area_objs[_data.battery.area_index].get());
         ESP_UTILS_CHECK_NULL_RETURN(battery_label, false, "Create battery label failed");
 
         lv_obj_add_style(battery_label.get(), _system_context.getDisplay().getCoreContainerStyle(), 0);
         _battery_label = battery_label;
-    }
-    if (_data.flags.enable_battery_icon) {
-        ESP_UTILS_CHECK_FALSE_RETURN(addIcon(_data.battery.icon_data, _data.battery.area_index, _battery_id), false,
-                                     "Add battery icon failed");
     }
 
     ESP_UTILS_CHECK_FALSE_GOTO(setBatteryPercent(false, 100), err, "Set battery percent failed");
